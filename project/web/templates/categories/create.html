@@ -1,0 +1,14 @@
+{{define "title"}}New Category{{end}}
+{{define "content"}}
+<h1>Create Category</h1>
+<form method="post" action="/categories">
+    <label>Name: <input type="text" name="name" required></label><br>
+    <label>Type:
+        <select name="type">
+            <option value="income">Income</option>
+            <option value="expense">Expense</option>
+        </select>
+    </label><br>
+    <button type="submit">Create</button>
+</form>
+{{end}}
