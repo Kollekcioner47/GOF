@@ -1,0 +1,883 @@
+Практика: Простой веб-сервер TODO на Go
+Шаг 1: Hello World сервер
+Что изучаем: Создание базового HTTP-сервера, обработка корневого маршрута
+
+go
+package main
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func main() {
+    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprintf(w, "TODO API работает!")
+    })
+
+    fmt.Println("Сервер запущен на http://localhost:8080")
+    http.ListenAndServe(":8080", nil)
+}
+
+Как работает:
+Строка 8: Объявляем функцию-обработчик для пути "/"
+Строка 9: Отправляем текстовый ответ клиенту
+Строка 13: Запускаем сервер на порту 8080
+
+Проверяем:
+
+
+curl http://localhost:8080/
+Должно вернуться: TODO API работает!
+
+Задание:
+Добавь обработку для пути /health, которая возвращает {"status": "healthy"}
+
+Шаг 2: Обработка разных роутов
+Что изучаем: Регистрация нескольких маршрутов, работа с JSON
+
+go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "net/http"
+)
+
+type HealthResponse struct {
+    Status string `json:"status"`
+}
+
+func main() {
+    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprintf(w, "TODO API работает!")
+    })
+
+    http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(HealthResponse{Status: "ok"})
+    })
+
+    http.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode([]interface{}{})
+    })
+
+    fmt.Println("Сервер запущен на http://localhost:8080")
+    http.ListenAndServe(":8080", nil)
+}
+
+Как работает:
+Строка 9: Определяем структуру для JSON-ответа
+Строка 20: Устанавливаем заголовок Content-Type
+Строка 21: Кодируем структуру в JSON и отправляем
+Строка 25: Возвращаем пустой массив задач
+
+Проверяем:
+curl http://localhost:8080/ping
+Должно вернуться: {"status":"ok"}
+
+curl http://localhost:8080/tasks
+Должно вернуться: []
+
+Задание:
+Добавь маршрут /version, который возвращает {"version": "1.0.0"}
+
+Шаг 3: Хранение задач в памяти
+Что изучаем: Использование map для хранения данных, структуры Go
+
+go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "sync"
+)
+
+type Task struct {
+    ID   int    `json:"id"`
+    Task string `json:"task"`
+    Done bool   `json:"done"`
+}
+
+var (
+    tasks   = make(map[int]Task)
+    nextID  = 1
+    mu      sync.RWMutex
+)
+
+func main() {
+    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprintf(w, "TODO API работает!")
+    })
+
+    http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+    })
+
+    http.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        
+        mu.RLock()
+        taskList := make([]Task, 0, len(tasks))
+        for _, task := range tasks {
+            taskList = append(taskList, task)
+        }
+        mu.RUnlock()
+        
+        json.NewEncoder(w).Encode(taskList)
+    })
+
+    fmt.Println("Сервер запущен на http://localhost:8080")
+    http.ListenAndServe(":8080", nil)
+}
+
+Как работает:
+Строка 11-15: Определяем структуру задачи
+Строка 18: Инициализируем map для хранения задач
+Строка 20: Мьютекс для безопасного доступа из нескольких горутин
+Строки 39-45: Безопасно читаем задачи и преобразуем в slice
+
+Проверяем:
+
+curl http://localhost:8080/tasks
+Должно вернуться: []
+
+Задание:
+Добавь начальные тестовые задачи при запуске сервера
+
+Шаг 4: Добавление задач (POST)
+Что изучаем: Обработка POST-запросов, чтение JSON из тела запроса
+
+go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "sync"
+)
+
+type Task struct {
+    ID   int    `json:"id"`
+    Task string `json:"task"`
+    Done bool   `json:"done"`
+}
+
+type CreateTaskRequest struct {
+    Task string `json:"task"`
+}
+
+var (
+    tasks   = make(map[int]Task)
+    nextID  = 1
+    mu      sync.RWMutex
+)
+
+func main() {
+    // ... предыдущие обработчики ...
+
+    http.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
+        switch r.Method {
+        case "GET":
+            w.Header().Set("Content-Type", "application/json")
+            
+            mu.RLock()
+            taskList := make([]Task, 0, len(tasks))
+            for _, task := range tasks {
+                taskList = append(taskList, task)
+            }
+            mu.RUnlock()
+            
+            json.NewEncoder(w).Encode(taskList)
+            
+        case "POST":
+            var req CreateTaskRequest
+            if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+                http.Error(w, "Неверный JSON", http.StatusBadRequest)
+                return
+            }
+            
+            if req.Task == "" {
+                http.Error(w, "Задача не может быть пустой", http.StatusBadRequest)
+                return
+            }
+            
+            mu.Lock()
+            task := Task{
+                ID:   nextID,
+                Task: req.Task,
+                Done: false,
+            }
+            tasks[nextID] = task
+            nextID++
+            mu.Unlock()
+            
+            w.Header().Set("Content-Type", "application/json")
+            w.WriteHeader(http.StatusCreated)
+            json.NewEncoder(w).Encode(task)
+            
+        default:
+            http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+        }
+    })
+
+    fmt.Println("Сервер запущен на http://localhost:8080")
+    http.ListenAndServe(":8080", nil)
+}
+
+Как работает:
+Строка 35: Разделяем обработку по методу HTTP
+Строки 50-54: Декодируем JSON из тела запроса
+Строки 64-71: Создаем и сохраняем задачу
+Строка 74: Устанавливаем статус 201 Created
+
+Проверяем:
+
+
+curl -X POST http://localhost:8080/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"task": "Купить молоко"}'
+Должно вернуться задача с ID 1
+
+curl http://localhost:8080/tasks
+Должен показать массив с одной задачей
+
+Задание:
+Добавь проверку на максимальную длину задачи (например, 100 символов)
+
+Шаг 5: Получение одной задачи
+Что изучаем: Обработка динамических маршрутов, извлечение параметров из URL
+
+go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "strconv"
+    "strings"
+    "sync"
+)
+
+// ... структуры и переменные ...
+
+func getTaskHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != "GET" {
+        http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+        return
+    }
+    
+    // Извлекаем ID из URL /tasks/123
+    parts := strings.Split(r.URL.Path, "/")
+    if len(parts) != 3 {
+        http.Error(w, "Неверный URL", http.StatusBadRequest)
+        return
+    }
+    
+    id, err := strconv.Atoi(parts[2])
+    if err != nil {
+        http.Error(w, "Неверный ID", http.StatusBadRequest)
+        return
+    }
+    
+    mu.RLock()
+    task, exists := tasks[id]
+    mu.RUnlock()
+    
+    if !exists {
+        http.Error(w, "Задача не найдена", http.StatusNotFound)
+        return
+    }
+    
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(task)
+}
+
+func main() {
+    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprintf(w, "TODO API работает!")
+    })
+
+    http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+    })
+
+    http.HandleFunc("/tasks", tasksHandler)
+    http.HandleFunc("/tasks/", getTaskHandler)
+
+    fmt.Println("Сервер запущен на http://localhost:8080")
+    http.ListenAndServe(":8080", nil)
+}
+
+// Вынесем обработчик /tasks в отдельную функцию
+func tasksHandler(w http.ResponseWriter, r *http.Request) {
+    // ... код из предыдущего шага ...
+}
+
+Как работает:
+Строки 17-24: Извлекаем ID из пути URL
+Строка 26: Преобразуем строку в число
+Строки 30-34: Проверяем существование задачи
+Строка 70: Регистрируем обработчик для /tasks/ (слеш в конце!)
+
+Проверяем:
+
+curl http://localhost:8080/tasks/1
+Должна вернуться задача с ID 1
+
+curl http://localhost:8080/tasks/999
+Должен вернуться 404 Not Found
+
+Задание:
+Добавь обработку пути /tasks/ (без ID), которая возвращает все задачи
+
+Шаг 6: Удаление задач
+Что изучаем: Обработка DELETE-запросов, полная реализация CRUD
+
+go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "strconv"
+    "strings"
+    "sync"
+)
+
+// ... структуры и переменные ...
+
+func taskDetailHandler(w http.ResponseWriter, r *http.Request) {
+    parts := strings.Split(r.URL.Path, "/")
+    if len(parts) != 3 {
+        http.Error(w, "Неверный URL", http.StatusBadRequest)
+        return
+    }
+    
+    id, err := strconv.Atoi(parts[2])
+    if err != nil {
+        http.Error(w, "Неверный ID", http.StatusBadRequest)
+        return
+    }
+    
+    switch r.Method {
+    case "GET":
+        mu.RLock()
+        task, exists := tasks[id]
+        mu.RUnlock()
+        
+        if !exists {
+            http.Error(w, "Задача не найдена", http.StatusNotFound)
+            return
+        }
+        
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(task)
+        
+    case "DELETE":
+        mu.Lock()
+        _, exists := tasks[id]
+        if exists {
+            delete(tasks, id)
+        }
+        mu.Unlock()
+        
+        if !exists {
+            http.Error(w, "Задача не найдена", http.StatusNotFound)
+            return
+        }
+        
+        w.WriteHeader(http.StatusNoContent)
+        
+    default:
+        http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+    }
+}
+
+func main() {
+    // Добавим тестовые задачи
+    mu.Lock()
+    tasks[1] = Task{ID: 1, Task: "Изучить Go", Done: false}
+    tasks[2] = Task{ID: 2, Task: "Создать TODO API", Done: true}
+    nextID = 3
+    mu.Unlock()
+    
+    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprintf(w, "TODO API работает!")
+    })
+
+    http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+    })
+
+    http.HandleFunc("/tasks", tasksHandler)
+    http.HandleFunc("/tasks/", taskDetailHandler)
+
+    fmt.Println("Сервер запущен на http://localhost:8080")
+    http.ListenAndServe(":8080", nil)
+}
+
+Как работает:
+Строки 48-56: Удаляем задачу из map
+Строка 63: Возвращаем статус 204 No Content
+Строки 72-77: Инициализируем тестовые данные
+
+Проверяем:
+
+
+curl -X DELETE http://localhost:8080/tasks/1
+Должен вернуться статус 204
+
+
+curl http://localhost:8080/tasks
+Должна остаться только одна задача
+
+Задание:
+Добавь метод PATCH для обновления задачи (изменение поля "done")
+
+Шаг 7: Middleware для логирования
+Что изучаем: Создание middleware, композиция обработчиков
+
+go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "strconv"
+    "strings"
+    "sync"
+    "time"
+)
+
+// ... структуры и переменные ...
+
+func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        
+        // Создаем обертку для ResponseWriter для захвата статуса
+        rw := &responseWriter{w, http.StatusOK}
+        
+        next(rw, r)
+        
+        log.Printf("%s %s %d %s", 
+            r.Method, 
+            r.URL.Path, 
+            rw.status,
+            time.Since(start))
+    }
+}
+
+type responseWriter struct {
+    http.ResponseWriter
+    status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+    rw.status = code
+    rw.ResponseWriter.WriteHeader(code)
+}
+
+func main() {
+    // Инициализация тестовых данных
+    mu.Lock()
+    tasks[1] = Task{ID: 1, Task: "Изучить Go", Done: false}
+    tasks[2] = Task{ID: 2, Task: "Создать TODO API", Done: true}
+    nextID = 3
+    mu.Unlock()
+    
+    // Регистрация маршрутов с middleware
+    http.HandleFunc("/", loggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprintf(w, "TODO API работает!")
+    }))
+
+    http.HandleFunc("/ping", loggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+    }))
+
+    http.HandleFunc("/tasks", loggingMiddleware(tasksHandler))
+    http.HandleFunc("/tasks/", loggingMiddleware(taskDetailHandler))
+
+    fmt.Println("Сервер запущен на http://localhost:8080")
+    http.ListenAndServe(":8080", nil)
+}
+
+Как работает:
+Строки 18-32: Middleware логирует каждый запрос
+Строка 25: Перехватываем статус ответа
+Строки 34-40: Кастомный ResponseWriter
+Строка 56: Оборачиваем обработчики в middleware
+
+Проверяем:
+Запусти сервер и сделай несколько запросов. В консоли увидишь логи:
+
+
+GET /tasks 200 123.456µs
+POST /tasks 201 234.567µs
+Задание:
+Добавь в middleware логирование User-Agent заголовка
+
+Шаг 8: Graceful shutdown
+Что изучам: Корректное завершение сервера, обработка сигналов
+
+go
+package main
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "strconv"
+    "strings"
+    "sync"
+    "syscall"
+    "time"
+)
+
+// ... структуры, переменные, middleware ...
+
+func main() {
+    // Инициализация тестовых данных
+    mu.Lock()
+    tasks[1] = Task{ID: 1, Task: "Изучить Go", Done: false}
+    tasks[2] = Task{ID: 2, Task: "Создать TODO API", Done: true}
+    nextID = 3
+    mu.Unlock()
+    
+    // Создаем сервер с настройками
+    server := &http.Server{
+        Addr:         ":8080",
+        Handler:      nil, // используем DefaultServeMux
+        ReadTimeout:  10 * time.Second,
+        WriteTimeout: 10 * time.Second,
+        IdleTimeout:  60 * time.Second,
+    }
+    
+    // Регистрация обработчиков
+    http.HandleFunc("/", loggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprintf(w, "TODO API работает!")
+    }))
+
+    http.HandleFunc("/ping", loggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+    }))
+
+    http.HandleFunc("/tasks", loggingMiddleware(tasksHandler))
+    http.HandleFunc("/tasks/", loggingMiddleware(taskDetailHandler))
+    
+    // Канал для graceful shutdown
+    stop := make(chan os.Signal, 1)
+    signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+    
+    // Запуск сервера в отдельной горутине
+    go func() {
+        fmt.Println("Сервер запущен на http://localhost:8080")
+        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            log.Fatalf("Ошибка сервера: %v", err)
+        }
+    }()
+    
+    // Ожидаем сигнал завершения
+    <-stop
+    fmt.Println("\nПолучен сигнал завершения...")
+    
+    // Graceful shutdown
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    
+    if err := server.Shutdown(ctx); err != nil {
+        log.Fatalf("Ошибка при завершении сервера: %v", err)
+    }
+    
+    fmt.Println("Сервер корректно завершен")
+}
+
+Как работает:
+Строки 31-37: Создаем настроенный HTTP-сервер
+Строки 54-55: Настраиваем обработку сигналов
+Строка 72: Graceful shutdown с таймаутом
+Строка 77: Ждем завершения обработки запросов
+
+Проверяем:
+Запусти сервер
+Сделай несколько запросов
+Нажми Ctrl+C
+Сервер должен корректно завершиться
+
+Полный рабочий проект
+go
+package main
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "strconv"
+    "strings"
+    "sync"
+    "syscall"
+    "time"
+)
+
+// Структуры данных
+type Task struct {
+    ID   int    `json:"id"`
+    Task string `json:"task"`
+    Done bool   `json:"done"`
+}
+
+type CreateTaskRequest struct {
+    Task string `json:"task"`
+}
+
+// Глобальные переменные
+var (
+    tasks  = make(map[int]Task)
+    nextID = 1
+    mu     sync.RWMutex
+)
+
+// Middleware для логирования
+type responseWriter struct {
+    http.ResponseWriter
+    status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+    rw.status = code
+    rw.ResponseWriter.WriteHeader(code)
+}
+
+func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        rw := &responseWriter{w, http.StatusOK}
+        
+        next(rw, r)
+        
+        log.Printf("%s %s %d %s", 
+            r.Method, 
+            r.URL.Path, 
+            rw.status,
+            time.Since(start))
+    }
+}
+
+// Обработчики
+func tasksHandler(w http.ResponseWriter, r *http.Request) {
+    switch r.Method {
+    case "GET":
+        mu.RLock()
+        taskList := make([]Task, 0, len(tasks))
+        for _, task := range tasks {
+            taskList = append(taskList, task)
+        }
+        mu.RUnlock()
+        
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(taskList)
+        
+    case "POST":
+        var req CreateTaskRequest
+        if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+            http.Error(w, "Неверный JSON", http.StatusBadRequest)
+            return
+        }
+        
+        if req.Task == "" {
+            http.Error(w, "Задача не может быть пустой", http.StatusBadRequest)
+            return
+        }
+        
+        mu.Lock()
+        task := Task{
+            ID:   nextID,
+            Task: req.Task,
+            Done: false,
+        }
+        tasks[nextID] = task
+        nextID++
+        mu.Unlock()
+        
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusCreated)
+        json.NewEncoder(w).Encode(task)
+        
+    default:
+        http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+    }
+}
+
+func taskDetailHandler(w http.ResponseWriter, r *http.Request) {
+    parts := strings.Split(r.URL.Path, "/")
+    if len(parts) != 3 {
+        http.Error(w, "Неверный URL", http.StatusBadRequest)
+        return
+    }
+    
+    id, err := strconv.Atoi(parts[2])
+    if err != nil {
+        http.Error(w, "Неверный ID", http.StatusBadRequest)
+        return
+    }
+    
+    switch r.Method {
+    case "GET":
+        mu.RLock()
+        task, exists := tasks[id]
+        mu.RUnlock()
+        
+        if !exists {
+            http.Error(w, "Задача не найдена", http.StatusNotFound)
+            return
+        }
+        
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(task)
+        
+    case "DELETE":
+        mu.Lock()
+        _, exists := tasks[id]
+        if exists {
+            delete(tasks, id)
+        }
+        mu.Unlock()
+        
+        if !exists {
+            http.Error(w, "Задача не найдена", http.StatusNotFound)
+            return
+        }
+        
+        w.WriteHeader(http.StatusNoContent)
+        
+    default:
+        http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+    }
+}
+
+func main() {
+    // Инициализация тестовых данных
+    mu.Lock()
+    tasks[1] = Task{ID: 1, Task: "Изучить Go", Done: false}
+    tasks[2] = Task{ID: 2, Task: "Создать TODO API", Done: true}
+    nextID = 3
+    mu.Unlock()
+    
+    // Настройка сервера
+    server := &http.Server{
+        Addr:         ":8080",
+        ReadTimeout:  10 * time.Second,
+        WriteTimeout: 10 * time.Second,
+        IdleTimeout:  60 * time.Second,
+    }
+    
+    // Регистрация маршрутов
+    http.HandleFunc("/", loggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprintf(w, "TODO API работает!")
+    }))
+
+    http.HandleFunc("/ping", loggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+    }))
+
+    http.HandleFunc("/tasks", loggingMiddleware(tasksHandler))
+    http.HandleFunc("/tasks/", loggingMiddleware(taskDetailHandler))
+    
+    // Graceful shutdown
+    stop := make(chan os.Signal, 1)
+    signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+    
+    go func() {
+        fmt.Println("Сервер запущен на http://localhost:8080")
+        fmt.Println("Нажми Ctrl+C для завершения")
+        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            log.Fatalf("Ошибка сервера: %v", err)
+        }
+    }()
+    
+    <-stop
+    fmt.Println("\nЗавершение работы...")
+    
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    
+    if err := server.Shutdown(ctx); err != nil {
+        log.Fatalf("Ошибка при завершении: %v", err)
+    }
+    
+    fmt.Println("Сервер остановлен")
+}
+
+Тестирование API
+1. Проверка работоспособности:
+
+curl http://localhost:8080/
+2. Проверка здоровья:
+
+curl http://localhost:8080/ping
+3. Получение всех задач:
+
+curl http://localhost:8080/tasks
+4. Создание новой задачи:
+
+
+curl -X POST http://localhost:8080/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"task": "Купить молоко"}'
+5. Получение конкретной задачи:
+
+
+curl http://localhost:8080/tasks/1
+6. Удаление задачи:
+
+
+curl -X DELETE http://localhost:8080/tasks/1
+7. Просмотр логов:
+Запусти сервер и выполни несколько запросов. В консоли увидишь:
+
+
+GET /tasks 200 45.678µs
+POST /tasks 201 89.123µs
+DELETE /tasks/1 204 23.456µs
+
+Что ты изучил:
+Создание HTTP-сервера на Go
+Обработку различных HTTP-методов
+Работу с JSON (кодирование/декодирование)
+Хранение данных в памяти с использованием map
+Безопасный доступ к данным из горутин (sync.RWMutex)
+Создание middleware для логирования
+Graceful shutdown для корректного завершения
+Построение RESTful API
+
+Дальнейшие улучшения:
+Добавь PATCH-метод для обновления задач
+Добавь валидацию (максимальная длина задачи)
+Реализуй фильтрацию задач по статусу (/tasks?done=true)
+Добавь пагинацию для списка задач
+Сохраняй данные в файл или базу данных
+Добавь тесты с помощью пакета net/http/httptest

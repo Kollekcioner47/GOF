@@ -1,0 +1,1380 @@
+Пошаговое руководство для начинающих
+В этом руководстве вы создадите полноценное веб-приложение для учёта личных финансов. Бэкенд на Go, данные хранятся в PostgreSQL. Всё разворачивается на одной виртуальной машине Ubuntu.
+
+Целевая аудитория: разработчики, знакомые с основами Go (переменные, функции, структуры, интерфейсы) и базовым SQL.
+
+Стек:
+Go 1.22+
+PostgreSQL 16+
+Маршрутизация: gorilla/mux
+Шаблоны: html/template
+Сессии: gorilla/sessions
+Миграции: golang-migrate/migrate
+Деплой: systemd + Nginx
+
+Шаг 0. Подготовка виртуальной машины (Ubuntu Server)
+Цель: настроить сервер для разработки и будущего деплоя.
+
+Действия:
+Создайте виртуальную машину (VirtualBox, VMWare или облачный провайдер) с Ubuntu Server 22.04/24.04. Минимальные требования: 1 CPU, 1-2 GB RAM, 10 GB диска.
+
+Подключитесь по SSH и обновите систему:
+sudo apt update && sudo apt upgrade -y
+Установите Go (вручную, чтобы получить последнюю версию):
+wget https://go.dev/dl/go1.22.5.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.22.5.linux-amd64.tar.gz
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+source ~/.bashrc
+go version   # проверка
+
+Установите PostgreSQL:
+sudo apt install postgresql postgresql-contrib curl -y
+sudo systemctl start postgresql
+sudo systemctl enable postgresql
+
+Создайте базу данных и пользователя:
+sudo -u postgres psql
+В консоли psql выполните:
+CREATE DATABASE finance_db;
+CREATE USER finance_user WITH PASSWORD 'secure_password';
+GRANT ALL PRIVILEGES ON DATABASE finance_db TO finance_user;
+GRANT ALL ON SCHEMA public TO finance_user;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO finance_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO finance_user;
+\q
+
+Установите инструмент для миграций migrate:
+curl -L https://github.com/golang-migrate/migrate/releases/download/v4.17.0/migrate.linux-amd64.tar.gz | tar xvz
+sudo mv migrate /usr/local/bin/
+migrate -version   # проверка
+Установите Git 
+sudo apt install git -y
+
+Шаг 1. Проектирование базы данных и создание миграций
+Цель: создать SQL-файлы миграций, которые будут создавать таблицы users, categories, transactions.
+
+1.1. Создайте директорию для миграций
+В домашней папке пользователя (или в месте, где будет лежать проект) выполните:
+mkdir -p ~/finance-app/migrations
+cd ~/finance-app
+
+1.2. Создайте файл 000001_init.up.sql
+nano migrations/000001_init.up.sql
+Вставьте содержимое:
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE categories (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name VARCHAR(100) NOT NULL,
+    type VARCHAR(10) NOT NULL CHECK (type IN ('income', 'expense')),
+    UNIQUE(user_id, name)
+);
+
+CREATE TABLE transactions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+    amount DECIMAL(12,2) NOT NULL,
+    description TEXT,
+    date DATE NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+1.3. Создайте файл отката 000001_init.down.sql
+nano migrations/000001_init.down.sql
+DROP TABLE IF EXISTS transactions;
+DROP TABLE IF EXISTS categories;
+DROP TABLE IF EXISTS users;
+
+Объяснение: Миграции позволяют версионировать схему БД. Файл .up применяет изменения, .down откатывает их.
+
+Шаг 2. Инициализация Go-модуля и создание структуры проекта
+Цель: создать Go-модуль и папки для кода согласно чистой архитектуре.
+
+2.1. Инициализация модуля
+Убедитесь, что вы находитесь в директории ~/finance-app:
+go mod init github.com/yourusername/finance-app   # замените yourusername на ваш GitHub или оставьте как есть
+
+2.2. Создайте структуру папок и пустые файлы
+Выполните команду:
+mkdir -p cmd/server internal/{config,handlers,models,repository,service,middleware} web/{templates,static}
+touch cmd/server/main.go \
+      internal/config/config.go \
+      internal/handlers/handlers.go \
+      internal/models/models.go \
+      internal/repository/repository.go \
+      internal/service/service.go \
+      internal/middleware/middleware.go \
+      .env
+
+Пояснение структуры:
+
+cmd/server/main.go — точка входа.
+internal/ — внутренние пакеты, не предназначенные для импорта извне.
+config — загрузка конфигурации (переменные окружения).
+handlers — HTTP-обработчики.
+models — структуры данных.
+repository — работа с БД (DAO).
+service — бизнес-логика.
+middleware — промежуточные обработчики.
+migrations — уже есть.
+web/templates — HTML-шаблоны.
+web/static — CSS, JS, изображения.
+.env — файл с переменными окружения (не попадает в репозиторий).
+
+Шаг 3. Подключение к PostgreSQL и применение миграций
+Цель: написать код для подключения к БД и автоматического применения миграций при старте приложения.
+
+3.1. Установите необходимые пакеты
+go get github.com/lib/pq
+go get github.com/golang-migrate/migrate/v4
+go get github.com/golang-migrate/migrate/v4/database/postgres
+go get github.com/golang-migrate/migrate/v4/source/file
+go get github.com/joho/godotenv   # для загрузки .env
+
+3.2. Создайте файл конфигурации internal/config/config.go
+package config
+
+import (
+    "log"
+    "os"
+    "github.com/joho/godotenv"
+)
+
+type Config struct {
+    DatabaseURL string
+    SessionKey  string
+    Port        string
+}
+
+func Load() *Config {
+    err := godotenv.Load()
+    if err != nil {
+        log.Println("No .env file found, using environment variables")
+    }
+
+    return &Config{
+        DatabaseURL: getEnv("DATABASE_URL", "postgres://finance_user:secure_password@localhost/finance_db?sslmode=disable"),
+        SessionKey:  getEnv("SESSION_KEY", "super-secret-key-change-in-production"),
+        Port:        getEnv("PORT", "8080"),
+    }
+}
+
+func getEnv(key, defaultValue string) string {
+    if value, exists := os.LookupEnv(key); exists {
+        return value
+    }
+    return defaultValue
+}
+
+3.3. Создайте файл internal/repository/db.go с функцией подключения
+package repository
+
+import (
+    "database/sql"
+    "fmt"
+    _ "github.com/lib/pq"
+)
+
+func NewPostgresDB(connStr string) (*sql.DB, error) {
+    db, err := sql.Open("postgres", connStr)
+    if err != nil {
+        return nil, fmt.Errorf("failed to open db: %w", err)
+    }
+    if err = db.Ping(); err != nil {
+        return nil, fmt.Errorf("failed to ping db: %w", err)
+    }
+    return db, nil
+}
+
+3.4. Напишите функцию для применения миграций
+Создайте файл internal/repository/migrate.go:
+package repository
+
+import (
+    "fmt"
+    "github.com/golang-migrate/migrate/v4"
+    _ "github.com/golang-migrate/migrate/v4/database/postgres"
+    _ "github.com/golang-migrate/migrate/v4/source/file"
+)
+
+func RunMigrations(dbURL string) error {
+    m, err := migrate.New("file://migrations", dbURL)
+    if err != nil {
+        return fmt.Errorf("failed to create migrate instance: %w", err)
+    }
+    if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+        return fmt.Errorf("failed to run migrations: %w", err)
+    }
+    return nil
+}
+
+3.5. Обновите cmd/server/main.go для использования конфига и миграций
+
+package main
+
+import (
+    "github.com/yourusername/finance-app/internal/config"
+    "github.com/yourusername/finance-app/internal/repository"
+    "log"
+)
+
+func main() {
+    cfg := config.Load()
+
+    // Подключение к БД
+    db, err := repository.NewPostgresDB(cfg.DatabaseURL)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+
+    // Применение миграций
+    if err := repository.RunMigrations(cfg.DatabaseURL); err != nil {
+        log.Fatal(err)
+    }
+
+    log.Println("Database connected and migrations applied")
+    // TODO: запуск веб-сервера
+}
+Проверка: пока можно скомпилировать и запустить (сервер ещё не запустится, но ошибок быть не должно).
+
+Шаг 4. Модели данных и репозитории (User)
+Цель: создать структуры и интерфейсы для работы с пользователями.
+
+4.1. Модель пользователя internal/models/user.go
+package models
+
+import "time"
+
+type User struct {
+    ID           int
+    Email        string
+    PasswordHash string
+    CreatedAt    time.Time
+}
+
+4.2. Интерфейс репозитория пользователей internal/repository/user_repo.go
+package repository
+
+import "github.com/yourusername/finance-app/internal/models"
+
+type UserRepository interface {
+    Create(user *models.User) error
+    GetByID(id int) (*models.User, error)
+    GetByEmail(email string) (*models.User, error)
+    Update(user *models.User) error
+    Delete(id int) error
+}
+
+4.3. Реализация internal/repository/user_postgres.go
+package repository
+
+import (
+    "database/sql"
+    "github.com/yourusername/finance-app/internal/models"
+)
+
+type userRepo struct {
+    db *sql.DB
+}
+
+func NewUserRepository(db *sql.DB) UserRepository {
+    return &userRepo{db: db}
+}
+
+func (r *userRepo) Create(user *models.User) error {
+    query := `INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, created_at`
+    return r.db.QueryRow(query, user.Email, user.PasswordHash).Scan(&user.ID, &user.CreatedAt)
+}
+
+func (r *userRepo) GetByID(id int) (*models.User, error) {
+    var user models.User
+    query := `SELECT id, email, password_hash, created_at FROM users WHERE id = $1`
+    err := r.db.QueryRow(query, id).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.CreatedAt)
+    if err != nil {
+        return nil, err
+    }
+    return &user, nil
+}
+
+func (r *userRepo) GetByEmail(email string) (*models.User, error) {
+    var user models.User
+    query := `SELECT id, email, password_hash, created_at FROM users WHERE email = $1`
+    err := r.db.QueryRow(query, email).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.CreatedAt)
+    if err != nil {
+        return nil, err
+    }
+    return &user, nil
+}
+
+func (r *userRepo) Update(user *models.User) error {
+    query := `UPDATE users SET email = $1, password_hash = $2 WHERE id = $3`
+    _, err := r.db.Exec(query, user.Email, user.PasswordHash, user.ID)
+    return err
+}
+
+func (r *userRepo) Delete(id int) error {
+    query := `DELETE FROM users WHERE id = $1`
+    _, err := r.db.Exec(query, id)
+    return err
+}
+
+Объяснение: Репозиторий инкапсулирует запросы к БД. Интерфейс позволяет легко подменять реализацию (например, для тестов).
+
+Шаг 5. Бизнес-логика: сервис пользователей
+Цель: реализовать регистрацию и аутентификацию с хэшированием паролей.
+
+5.1. Установите пакет для bcrypt
+go get golang.org/x/crypto/bcrypt
+
+5.2. Создайте файл internal/service/user_service.go
+package service
+
+import (
+    "errors"
+    "github.com/yourusername/finance-app/internal/models"
+    "github.com/yourusername/finance-app/internal/repository"
+    "golang.org/x/crypto/bcrypt"
+)
+
+var (
+    ErrUserExists         = errors.New("user already exists")
+    ErrInvalidCredentials = errors.New("invalid credentials")
+)
+
+type UserService struct {
+    repo repository.UserRepository
+}
+
+func NewUserService(repo repository.UserRepository) *UserService {
+    return &UserService{repo: repo}
+}
+
+func (s *UserService) Register(email, password string) (*models.User, error) {
+    // Проверка, существует ли пользователь
+    existing, _ := s.repo.GetByEmail(email)
+    if existing != nil {
+        return nil, ErrUserExists
+    }
+
+    // Хэшируем пароль
+    hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+    if err != nil {
+        return nil, err
+    }
+
+    user := &models.User{
+        Email:        email,
+        PasswordHash: string(hash),
+    }
+    if err := s.repo.Create(user); err != nil {
+        return nil, err
+    }
+    return user, nil
+}
+
+func (s *UserService) Login(email, password string) (*models.User, error) {
+    user, err := s.repo.GetByEmail(email)
+    if err != nil {
+        return nil, ErrInvalidCredentials
+    }
+
+    if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
+        return nil, ErrInvalidCredentials
+    }
+    return user, nil
+}
+
+Объяснение: Сервис содержит бизнес-правила: проверка уникальности email, хэширование пароля перед сохранением, сравнение при логине.
+
+Шаг 6. Веб-сервер, маршрутизация и middleware
+Цель: запустить HTTP-сервер, определить маршруты, добавить middleware для логирования и восстановления после паник.
+
+6.1. Установите gorilla/mux и gorilla/sessions
+go get github.com/gorilla/mux
+go get github.com/gorilla/sessions
+
+6.2. Создайте middleware в internal/middleware/middleware.go
+package middleware
+
+import (
+    "log"
+    "net/http"
+    "time"
+)
+
+func Logger(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        next.ServeHTTP(w, r)
+        log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
+    })
+}
+
+func Recoverer(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        defer func() {
+            if err := recover(); err != nil {
+                log.Printf("panic: %v", err)
+                http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+            }
+        }()
+        next.ServeHTTP(w, r)
+    })
+}
+
+6.3. Создайте обработчик для главной страницы (пока заглушка)
+Создайте internal/handlers/home.go:
+package handlers
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func Index(w http.ResponseWriter, r *http.Request) {
+    fmt.Fprintln(w, "Hello, this is finance app!")
+}
+6.4. Обновите cmd/server/main.go для запуска сервера
+Замените содержимое main.go на:
+package main
+
+import (
+    "github.com/yourusername/finance-app/internal/config"
+    "github.com/yourusername/finance-app/internal/handlers"
+    "github.com/yourusername/finance-app/internal/middleware"
+    "github.com/yourusername/finance-app/internal/repository"
+    "github.com/yourusername/finance-app/internal/service"
+    "log"
+    "net/http"
+    "github.com/gorilla/mux"
+)
+
+func main() {
+    cfg := config.Load()
+
+    // Подключение к БД
+    db, err := repository.NewPostgresDB(cfg.DatabaseURL)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+
+    // Миграции
+    if err := repository.RunMigrations(cfg.DatabaseURL); err != nil {
+        log.Fatal(err)
+    }
+
+    // Инициализация репозиториев и сервисов
+    userRepo := repository.NewUserRepository(db)
+    userService := service.NewUserService(userRepo)
+    _ = userService   // говорит компилятору: "я знаю, что переменная не используется, не ругайся"
+
+    // Инициализация обработчиков (пока без userHandler, добавим позже)
+    // userHandler := handlers.NewUserHandler(userService)
+
+    r := mux.NewRouter()
+    r.Use(middleware.Logger)
+    r.Use(middleware.Recoverer)
+
+    // Публичные маршруты
+    // r.HandleFunc("/register", userHandler.Register).Methods("GET", "POST")
+    // r.HandleFunc("/login", userHandler.Login).Methods("GET", "POST")
+    // r.HandleFunc("/logout", userHandler.Logout).Methods("POST")
+
+    // Заглушка для главной
+    r.HandleFunc("/", handlers.Index).Methods("GET")
+
+    log.Printf("Server starting on :%s", cfg.Port)
+    log.Fatal(http.ListenAndServe(":"+cfg.Port, r))
+}
+
+6.5. Создайте файл .env в корне проекта
+DATABASE_URL=postgres://finance_user:secure_password@localhost/finance_db?sslmode=disable
+SESSION_KEY=super-secret-key-change-in-production
+PORT=8080
+
+6.6 Заполните пустые go файлы заглушками:
+Заполните пустые файлы объявлениями пакета. Для каждого из файлов нужно добавить хотя бы package <имя_пакета>. Например:
+internal/handlers/handlers.go:
+package handlers
+internal/models/models.go:
+package models
+internal/repository/repository.go:
+package repository
+internal/service/service.go:
+package service
+
+6.7. Запустите сервер для проверки
+go run cmd/server/main.go
+
+Откройте браузер по адресу http://localhost:8080 — вы должны увидеть сообщение "Hello, this is finance app!".
+
+Шаг 7. Шаблоны HTML и рендеринг
+Цель: создать базовый шаблон и научиться рендерить страницы с данными.
+
+7.1. Создайте базовый шаблон web/templates/layout/base.html
+mkdir -p web/templates/layout
+nano web/templates/layout/base.html
+Вставьте:
+{{define "base"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{block "title" .}}Finance App{{end}}</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <header>
+        {{template "header" .}}
+    </header>
+    <main>
+        {{template "content" .}}
+    </main>
+    <footer>
+        {{template "footer" .}}
+    </footer>
+</body>
+</html>
+{{end}}
+
+7.2. Создайте заглушки для header и footer
+web/templates/layout/header.html:
+{{define "header"}}
+<nav>
+    <a href="/">Home</a>
+    <a href="/transactions">Transactions</a>
+    <a href="/logout">Logout</a>
+</nav>
+{{end}}
+
+web/templates/layout/footer.html:
+{{define "footer"}}
+<p>&copy; 2025 Finance App</p>
+{{end}}
+
+7.3. Создайте функцию для рендеринга шаблонов
+Создайте файл internal/handlers/render.go:
+package handlers
+
+import (
+    "html/template"
+    "net/http"
+    "path/filepath"
+)
+
+func renderTemplate(w http.ResponseWriter, tmpl string, data interface{}) {
+    layouts := filepath.Join("web", "templates", "layout", "*.html")
+    content := filepath.Join("web", "templates", tmpl)
+
+    // Парсим все файлы макета и конкретный шаблон
+    files, err := filepath.Glob(layouts)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    files = append(files, content)
+
+    ts, err := template.ParseFiles(files...)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    err = ts.ExecuteTemplate(w, "base", data)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+    }
+}
+7.4. Создайте простую страницу, например, web/templates/index.html
+{{define "title"}}Home{{end}}
+{{define "content"}}
+<h1>Welcome to Finance App</h1>
+<p>This is your personal finance tracker.</p>
+{{end}}
+
+7.5. Обновите обработчик Index для использования шаблона
+В internal/handlers/home.go замените содержимое:
+package handlers
+
+import (
+    "net/http"
+)
+
+func Index(w http.ResponseWriter, r *http.Request) {
+    renderTemplate(w, "index.html", nil)
+}
+
+7.6. Создайте простой CSS-файл web/static/css/style.css
+mkdir -p web/static/css
+nano web/static/css/style.css
+
+body { font-family: Arial, sans-serif; margin: 20px; }
+nav a { margin-right: 10px; }
+
+7.7. Убедитесь, что статические файлы обслуживаются
+В main.go уже есть строка для статики (добавьте, если её нет):
+r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("./web/static"))))
+
+Перезапустите сервер и откройте http://localhost:8080 — теперь должна отобразиться HTML-страница с CSS.
+
+Шаг 8. Аутентификация и сессии
+Цель: реализовать регистрацию, вход и выход с использованием сессий.
+
+8.1. Создайте хранилище сессий в отдельном файле
+internal/session/store.go (новая папка internal/session):
+package session
+
+import (
+    "github.com/gorilla/sessions"
+)
+
+var Store *sessions.CookieStore
+
+func InitStore(key string) {
+    Store = sessions.NewCookieStore([]byte(key))
+}
+
+8.2. Добавьте middleware для аутентификации в internal/middleware/auth.go
+package middleware
+
+import (
+    "context"
+    "github.com/kollekcioner47/finance-app/internal/session"
+    "net/http"
+)
+
+func AuthRequired(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        sess, _ := session.Store.Get(r, "finance-session")
+        if auth, ok := sess.Values["authenticated"].(bool); !ok || !auth {
+            http.Redirect(w, r, "/login", http.StatusSeeOther)
+            return
+        }
+        // Добавляем userID в контекст для дальнейшего использования
+        ctx := context.WithValue(r.Context(), "userID", sess.Values["userID"])
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+
+8.3. Создайте обработчики для регистрации и логина
+Сначала создайте структуру UserHandler в internal/handlers/user_handler.go:
+
+package handlers
+
+import (
+    "github.com/kollekcioner47/finance-app/internal/service"
+    "github.com/kollekcioner47/finance-app/internal/session"
+    "net/http"
+)
+
+type UserHandler struct {
+    userService *service.UserService
+}
+
+func NewUserHandler(us *service.UserService) *UserHandler {
+    return &UserHandler{userService: us}
+}
+
+func (h *UserHandler) Register(w http.ResponseWriter, r *http.Request) {
+    if r.Method == http.MethodGet {
+        renderTemplate(w, "auth/register.html", nil)
+        return
+    }
+    // POST
+    email := r.FormValue("email")
+    password := r.FormValue("password")
+    _, err := h.userService.Register(email, password)
+    if err != nil {
+        renderTemplate(w, "auth/register.html", map[string]interface{}{"Error": err.Error()})
+        return
+    }
+    http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
+    if r.Method == http.MethodGet {
+        renderTemplate(w, "auth/login.html", nil)
+        return
+    }
+    email := r.FormValue("email")
+    password := r.FormValue("password")
+    user, err := h.userService.Login(email, password)
+    if err != nil {
+        renderTemplate(w, "auth/login.html", map[string]interface{}{"Error": "Invalid credentials"})
+        return
+    }
+    sess, _ := session.Store.Get(r, "finance-session")
+    sess.Values["authenticated"] = true
+    sess.Values["userID"] = user.ID
+    sess.Save(r, w)
+    http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (h *UserHandler) Logout(w http.ResponseWriter, r *http.Request) {
+    sess, _ := session.Store.Get(r, "finance-session")
+    sess.Values["authenticated"] = false
+    delete(sess.Values, "userID")
+    sess.Save(r, w)
+    http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+8.4. Создайте шаблоны для регистрации и входа
+web/templates/auth/register.html:
+{{define "title"}}Register{{end}}
+{{define "content"}}
+<h1>Register</h1>
+{{if .Error}}<p style="color:red">{{.Error}}</p>{{end}}
+<form method="post">
+    <label>Email: <input type="email" name="email" required></label><br>
+    <label>Password: <input type="password" name="password" required></label><br>
+    <button type="submit">Register</button>
+</form>
+<p>Already have an account? <a href="/login">Login</a></p>
+{{end}}
+
+web/templates/auth/login.html:
+{{define "title"}}Login{{end}}
+{{define "content"}}
+<h1>Login</h1>
+{{if .Error}}<p style="color:red">{{.Error}}</p>{{end}}
+<form method="post">
+    <label>Email: <input type="email" name="email" required></label><br>
+    <label>Password: <input type="password" name="password" required></label><br>
+    <button type="submit">Login</button>
+</form>
+<p>Don't have an account? <a href="/register">Register</a></p>
+{{end}}
+
+8.5. Обновите main.go для инициализации сессий и подключения обработчиков
+В main.go добавьте:
+import "github.com/kollekcioner47/finance-app/internal/session"
+
+func main() {
+    // ... после cfg
+    session.InitStore(cfg.SessionKey)
+
+    // ... после создания userService
+    userHandler := handlers.NewUserHandler(userService)
+
+    r := mux.NewRouter()
+    // ... middleware
+
+    // Публичные маршруты
+    r.HandleFunc("/register", userHandler.Register).Methods("GET", "POST")
+    r.HandleFunc("/login", userHandler.Login).Methods("GET", "POST")
+    r.HandleFunc("/logout", userHandler.Logout).Methods("POST")
+
+    // Защищённые маршруты
+    protected := r.PathPrefix("/").Subrouter()
+    protected.Use(middleware.AuthRequired)
+    protected.HandleFunc("/", handlers.Index).Methods("GET")
+    // Далее добавим /transactions и т.д.
+}
+
+8.6. Обновите шапку (header), чтобы показывать ссылки в зависимости от статуса
+Можно передавать в шаблон информацию о пользователе. Для простоты пока оставим как есть, но в реальном проекте нужно проверять аутентификацию и показывать соответствующие ссылки.
+
+Шаг 9. Модели и репозитории для категорий и транзакций
+Цель: создать структуры и репозитории для работы с категориями и транзакциями.
+
+9.1. Модели
+internal/models/category.go:
+package models
+
+type Category struct {
+    ID     int
+    UserID int
+    Name   string
+    Type   string // "income" or "expense"
+}
+
+internal/models/transaction.go:
+package models
+
+import "time"
+
+type Transaction struct {
+    ID          int
+    UserID      int
+    CategoryID  int
+    Amount      float64
+    Description string
+    Date        time.Time
+    CreatedAt   time.Time
+}
+
+9.2. Интерфейсы репозиториев
+internal/repository/category_repo.go:
+package repository
+
+import "github.com/kollekcioner47/finance-app/internal/models"
+
+type CategoryRepository interface {
+    Create(category *models.Category) error
+    GetByID(id int) (*models.Category, error)
+    GetByUserID(userID int) ([]*models.Category, error)
+    Update(category *models.Category) error
+    Delete(id int) error
+}
+
+internal/repository/transaction_repo.go:
+package repository
+
+import "github.com/kollekcioner47/finance-app/internal/models"
+
+type TransactionRepository interface {
+    Create(tx *models.Transaction) error
+    GetByID(id int) (*models.Transaction, error)
+    GetByUserID(userID int) ([]*models.Transaction, error)
+    Update(tx *models.Transaction) error
+    Delete(id int) error
+}
+
+9.3. Реализации
+internal/repository/category_postgres.go (пример для Create):
+package repository
+
+import (
+    "database/sql"
+    "github.com/kollekcioner47/finance-app/internal/models"
+)
+
+type categoryRepo struct {
+    db *sql.DB
+}
+
+func NewCategoryRepository(db *sql.DB) CategoryRepository {
+    return &categoryRepo{db: db}
+}
+
+func (r *categoryRepo) Create(category *models.Category) error {
+    query := `INSERT INTO categories (user_id, name, type) VALUES ($1, $2, $3) RETURNING id`
+    return r.db.QueryRow(query, category.UserID, category.Name, category.Type).Scan(&category.ID)
+}
+
+func (r *categoryRepo) GetByID(id int) (*models.Category, error) {
+    var cat models.Category
+    query := `SELECT id, user_id, name, type FROM categories WHERE id = $1`
+    err := r.db.QueryRow(query, id).Scan(&cat.ID, &cat.UserID, &cat.Name, &cat.Type)
+    if err != nil {
+        return nil, err
+    }
+    return &cat, nil
+}
+
+func (r *categoryRepo) GetByUserID(userID int) ([]*models.Category, error) {
+    rows, err := r.db.Query(`SELECT id, user_id, name, type FROM categories WHERE user_id = $1`, userID)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    var categories []*models.Category
+    for rows.Next() {
+        var cat models.Category
+        if err := rows.Scan(&cat.ID, &cat.UserID, &cat.Name, &cat.Type); err != nil {
+            return nil, err
+        }
+        categories = append(categories, &cat)
+    }
+    return categories, rows.Err()
+}
+
+func (r *categoryRepo) Update(category *models.Category) error {
+    query := `UPDATE categories SET name = $1, type = $2 WHERE id = $3`
+    _, err := r.db.Exec(query, category.Name, category.Type, category.ID)
+    return err
+}
+
+func (r *categoryRepo) Delete(id int) error {
+    query := `DELETE FROM categories WHERE id = $1`
+    _, err := r.db.Exec(query, id)
+    return err
+}
+
+
+
+
+
+internal/repository/transaction_postgres.go:
+package repository
+
+import (
+    "database/sql"
+    "github.com/kollekcioner47/finance-app/internal/models"
+)
+
+type transactionRepo struct {
+    db *sql.DB
+}
+
+func NewTransactionRepository(db *sql.DB) TransactionRepository {
+    return &transactionRepo{db: db}
+}
+
+func (r *transactionRepo) Create(tx *models.Transaction) error {
+    query := `INSERT INTO transactions (user_id, category_id, amount, description, date) 
+              VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`
+    return r.db.QueryRow(query, tx.UserID, tx.CategoryID, tx.Amount, tx.Description, tx.Date).
+        Scan(&tx.ID, &tx.CreatedAt)
+}
+
+func (r *transactionRepo) GetByID(id int) (*models.Transaction, error) {
+    var t models.Transaction
+    var categoryID sql.NullInt64
+    query := `SELECT id, user_id, category_id, amount, description, date, created_at 
+              FROM transactions WHERE id = $1`
+    err := r.db.QueryRow(query, id).Scan(
+        &t.ID, &t.UserID, &categoryID, &t.Amount, &t.Description, &t.Date, &t.CreatedAt,
+    )
+    if err != nil {
+        return nil, err
+    }
+    if categoryID.Valid {
+        t.CategoryID = int(categoryID.Int64)
+    } else {
+        t.CategoryID = 0 // или можно оставить 0, что означает "без категории"
+    }
+    return &t, nil
+}
+
+func (r *transactionRepo) GetByUserID(userID int) ([]*models.Transaction, error) {
+    rows, err := r.db.Query(
+        `SELECT id, user_id, category_id, amount, description, date, created_at 
+         FROM transactions WHERE user_id = $1 ORDER BY date DESC`, userID)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    var transactions []*models.Transaction
+    for rows.Next() {
+        var t models.Transaction
+        var categoryID sql.NullInt64
+        if err := rows.Scan(
+            &t.ID, &t.UserID, &categoryID, &t.Amount, &t.Description, &t.Date, &t.CreatedAt,
+        ); err != nil {
+            return nil, err
+        }
+        if categoryID.Valid {
+            t.CategoryID = int(categoryID.Int64)
+        } else {
+            t.CategoryID = 0
+        }
+        transactions = append(transactions, &t)
+    }
+    return transactions, rows.Err()
+}
+
+func (r *transactionRepo) Update(tx *models.Transaction) error {
+    query := `UPDATE transactions 
+              SET category_id = $1, amount = $2, description = $3, date = $4 
+              WHERE id = $5`
+    _, err := r.db.Exec(query, tx.CategoryID, tx.Amount, tx.Description, tx.Date, tx.ID)
+    return err
+}
+
+func (r *transactionRepo) Delete(id int) error {
+    query := `DELETE FROM transactions WHERE id = $1`
+    _, err := r.db.Exec(query, id)
+    return err
+}
+
+Шаг 10. Сервисы для категорий и транзакций
+Цель: добавить бизнес-логику для работы с категориями и транзакциями.
+
+10.1. Сервис категорий internal/service/category_service.go
+package service
+
+import (
+    "github.com/kollekcioner47/finance-app/internal/models"
+    "github.com/kollekcioner47/finance-app/internal/repository"
+)
+
+type CategoryService struct {
+    repo repository.CategoryRepository
+}
+
+func NewCategoryService(repo repository.CategoryRepository) *CategoryService {
+    return &CategoryService{repo: repo}
+}
+
+func (s *CategoryService) CreateCategory(userID int, name, categoryType string) (*models.Category, error) {
+    cat := &models.Category{
+        UserID: userID,
+        Name:   name,
+        Type:   categoryType,
+    }
+    if err := s.repo.Create(cat); err != nil {
+        return nil, err
+    }
+    return cat, nil
+}
+
+func (s *CategoryService) GetUserCategories(userID int) ([]*models.Category, error) {
+    return s.repo.GetByUserID(userID)
+}
+
+10.2. Сервис транзакций internal/service/transaction_service.go
+package service
+
+import (
+    "errors"
+    "github.com/kollekcioner47/finance-app/internal/models"
+    "github.com/kollekcioner47/finance-app/internal/repository"
+    "time"
+)
+
+type TransactionService struct {
+    repo repository.TransactionRepository
+}
+
+func NewTransactionService(repo repository.TransactionRepository) *TransactionService {
+    return &TransactionService{repo: repo}
+}
+
+func (s *TransactionService) CreateTransaction(userID, categoryID int, amount float64, description string, date time.Time) (*models.Transaction, error) {
+    if amount <= 0 {
+        return nil, errors.New("amount must be positive")
+    }
+    tx := &models.Transaction{
+        UserID:      userID,
+        CategoryID:  categoryID,
+        Amount:      amount,
+        Description: description,
+        Date:        date,
+    }
+    if err := s.repo.Create(tx); err != nil {
+        return nil, err
+    }
+    return tx, nil
+}
+
+func (s *TransactionService) GetUserTransactions(userID int) ([]*models.Transaction, error) {
+    return s.repo.GetByUserID(userID)
+}
+
+Шаг 11. Обработчики для транзакций и категорий
+Цель: создать HTTP-обработчики, которые будут отображать формы и обрабатывать POST-запросы.
+
+11.1. Обработчик категорий internal/handlers/category_handler.go
+Пример для отображения списка категорий и создания новой:
+package handlers
+
+import (
+    "github.com/kollekcioner47/finance-app/internal/service"
+    "net/http"
+)
+
+type CategoryHandler struct {
+    categoryService *service.CategoryService
+}
+
+func NewCategoryHandler(cs *service.CategoryService) *CategoryHandler {
+    return &CategoryHandler{categoryService: cs}
+}
+
+func (h *CategoryHandler) List(w http.ResponseWriter, r *http.Request) {
+    userID := getUserID(r) // нужно реализовать функцию получения userID из контекста
+    categories, err := h.categoryService.GetUserCategories(userID)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    data := map[string]interface{}{
+        "Categories": categories,
+    }
+    renderTemplate(w, "categories/list.html", data)
+}
+
+func (h *CategoryHandler) CreateForm(w http.ResponseWriter, r *http.Request) {
+    renderTemplate(w, "categories/create.html", nil)
+}
+
+func (h *CategoryHandler) Create(w http.ResponseWriter, r *http.Request) {
+    userID := getUserID(r)
+    name := r.FormValue("name")
+    catType := r.FormValue("type") // "income" or "expense"
+    _, err := h.categoryService.CreateCategory(userID, name, catType)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+    http.Redirect(w, r, "/categories", http.StatusSeeOther)
+}
+
+// вспомогательная функция для извлечения userID из контекста
+func getUserID(r *http.Request) int {
+    return r.Context().Value("userID").(int)
+}
+
+11.2. Обработчик транзакций internal/handlers/transaction_handler.go
+Аналогично:
+package handlers
+
+import (
+    "github.com/kollekcioner47/finance-app/internal/service"
+    "net/http"
+    "strconv"
+    "time"
+)
+
+type TransactionHandler struct {
+    transactionService *service.TransactionService
+    categoryService    *service.CategoryService
+}
+
+func NewTransactionHandler(ts *service.TransactionService, cs *service.CategoryService) *TransactionHandler {
+    return &TransactionHandler{transactionService: ts, categoryService: cs}
+}
+
+func (h *TransactionHandler) List(w http.ResponseWriter, r *http.Request) {
+    userID := getUserID(r)
+    transactions, err := h.transactionService.GetUserTransactions(userID)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    data := map[string]interface{}{
+        "Transactions": transactions,
+    }
+    renderTemplate(w, "transactions/list.html", data)
+}
+
+func (h *TransactionHandler) CreateForm(w http.ResponseWriter, r *http.Request) {
+    userID := getUserID(r)
+    categories, err := h.categoryService.GetUserCategories(userID)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    data := map[string]interface{}{
+        "Categories": categories,
+    }
+    renderTemplate(w, "transactions/create.html", data)
+}
+
+func (h *TransactionHandler) Create(w http.ResponseWriter, r *http.Request) {
+    userID := getUserID(r)
+    categoryID, _ := strconv.Atoi(r.FormValue("category_id"))
+    amount, _ := strconv.ParseFloat(r.FormValue("amount"), 64)
+    date, _ := time.Parse("2006-01-02", r.FormValue("date"))
+    description := r.FormValue("description")
+
+    _, err := h.transactionService.CreateTransaction(userID, categoryID, amount, description, date)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+    http.Redirect(w, r, "/transactions", http.StatusSeeOther)
+}
+
+11.3. Шаблоны для категорий и транзакций
+Создайте соответствующие HTML-файлы в web/templates/categories/ и web/templates/transactions/. Например:
+
+web/templates/categories/list.html:
+{{define "title"}}Categories{{end}}
+{{define "content"}}
+<h1>Your Categories</h1>
+<a href="/categories/create">Add Category</a>
+<ul>
+    {{range .Categories}}
+    <li>{{.Name}} ({{.Type}})</li>
+    {{else}}
+    <li>No categories yet.</li>
+    {{end}}
+</ul>
+{{end}}
+
+web/templates/categories/create.html:
+{{define "title"}}New Category{{end}}
+{{define "content"}}
+<h1>Create Category</h1>
+<form method="post" action="/categories">
+    <label>Name: <input type="text" name="name" required></label><br>
+    <label>Type:
+        <select name="type">
+            <option value="income">Income</option>
+            <option value="expense">Expense</option>
+        </select>
+    </label><br>
+    <button type="submit">Create</button>
+</form>
+{{end}}
+
+Создаём шаблоны для транзакций
+Файл web/templates/transactions/list.html
+mkdir -p web/templates/transactions
+nano web/templates/transactions/list.html
+{{define "title"}}Transactions{{end}}
+{{define "content"}}
+<h1>Your Transactions</h1>
+<a href="/transactions/create" class="btn">Add Transaction</a>
+<table border="1" cellpadding="5">
+    <tr>
+        <th>Date</th>
+        <th>Category</th>
+        <th>Amount</th>
+        <th>Description</th>
+        <th>Actions</th>
+    </tr>
+    {{range .Transactions}}
+    <tr>
+        <td>{{.Date.Format "2006-01-02"}}</td>
+        <td>{{.CategoryID}}</td> <!-- Позже можно подставить название категории -->
+        <td>{{printf "%.2f" .Amount}}</td>
+        <td>{{.Description}}</td>
+        <td>
+            <!-- Ссылки на редактирование/удаление можно добавить позже -->
+            <a href="#">Edit</a> | <a href="#">Delete</a>
+        </td>
+    </tr>
+    {{else}}
+    <tr><td colspan="5">No transactions yet.</td></tr>
+    {{end}}
+</table>
+{{end}}
+
+Файл web/templates/transactions/create.html
+nano web/templates/transactions/create.html
+{{define "title"}}New Transaction{{end}}
+{{define "content"}}
+<h1>Add Transaction</h1>
+<form method="post" action="/transactions">
+    <label>Category:
+        <select name="category_id" required>
+            <option value="">-- Select --</option>
+            {{range .Categories}}
+            <option value="{{.ID}}">{{.Name}} ({{.Type}})</option>
+            {{end}}
+        </select>
+    </label><br>
+    <label>Amount: <input type="number" step="0.01" name="amount" required></label><br>
+    <label>Date: <input type="date" name="date" value="{{.Today}}" required></label><br>
+    <label>Description: <textarea name="description"></textarea></label><br>
+    <button type="submit">Save</button>
+</form>
+<p><a href="/transactions">Back to transactions</a></p>
+{{end}}
+
+Обновите обработчик CreateForm в transaction_handler.go
+В методе CreateForm добавьте в data текущую дату:
+func (h *TransactionHandler) CreateForm(w http.ResponseWriter, r *http.Request) {
+    userID := getUserID(r)
+    categories, err := h.categoryService.GetUserCategories(userID)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    data := map[string]interface{}{
+        "Categories": categories,
+        "Today":      time.Now().Format("2006-01-02"),
+    }
+    renderTemplate(w, "transactions/create.html", data)
+}
+
+
+Добавим навигационные ссылки в шапку
+Отредактируйте файл web/templates/layout/header.html:
+{{define "header"}}
+<nav>
+    <a href="/">Home</a>
+    <a href="/categories">Categories</a>
+    <a href="/transactions">Transactions</a>
+    <a href="/logout">Logout</a>
+</nav>
+{{end}}
+
+
+11.4. Подключите новые обработчики в main.go
+В main.go после инициализации репозиториев и сервисов:
+
+categoryRepo := repository.NewCategoryRepository(db)
+categoryService := service.NewCategoryService(categoryRepo)
+transactionRepo := repository.NewTransactionRepository(db)
+transactionService := service.NewTransactionService(transactionRepo)
+
+categoryHandler := handlers.NewCategoryHandler(categoryService)
+transactionHandler := handlers.NewTransactionHandler(transactionService, categoryService)
+
+// В защищённой подмаршруте:
+protected.HandleFunc("/categories", categoryHandler.List).Methods("GET")
+protected.HandleFunc("/categories/create", categoryHandler.CreateForm).Methods("GET")
+protected.HandleFunc("/categories", categoryHandler.Create).Methods("POST")
+protected.HandleFunc("/transactions", transactionHandler.List).Methods("GET")
+protected.HandleFunc("/transactions/create", transactionHandler.CreateForm).Methods("GET")
+protected.HandleFunc("/transactions", transactionHandler.Create).Methods("POST")
+
+
+Шаг 12. Деплой на виртуальную машину
+Цель: собрать бинарник, настроить systemd и Nginx.
+
+12.1. Сборка бинарника для Linux
+На вашей машине разработчика (или на самой виртуалке, если вы там пишете код) выполните:
+cd ~/finance-app
+GOOS=linux GOARCH=amd64 go build -o finance-app ./cmd/server
+
+12.3. Создайте systemd unit-файл
+На сервере создайте файл /etc/systemd/system/finance.service:
+sudo nano /etc/systemd/system/finance.service
+
+[Unit]
+Description=Finance App
+After=network.target postgresql.service
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/finance-app
+ExecStart=/opt/finance-app/finance-app
+Restart=always
+Environment="DATABASE_URL=postgres://finance_user:secure_password@localhost/finance_db?sslmode=disable"
+Environment="SESSION_KEY=another-super-secret-key"
+Environment="PORT=8080"
+
+[Install]
+WantedBy=multi-user.target
+
+12.4. Запустите сервис
+sudo systemctl daemon-reload
+sudo systemctl enable finance
+sudo systemctl start finance
+sudo systemctl status finance   # проверить
+
+12.5. Установите и настройте Nginx
+sudo apt install nginx -y
+Создайте конфигурацию /etc/nginx/sites-available/finance:
+server {
+    listen 80;
+    server_name your_domain_or_ip;
+
+    location / {
+        proxy_pass http://localhost:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    location /static/ {
+        alias /opt/finance-app/web/static/;
+    }
+}
+
+Включите сайт:
+sudo ln -s /etc/nginx/sites-available/finance /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+Теперь приложение доступно по IP сервера на 80 порту.
+
+
+
